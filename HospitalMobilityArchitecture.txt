@@ -1,0 +1,36 @@
+hospital-mobility/
+├── hardware/
+│   ├── esp32_firmware/
+│   └── sensor_calibration/
+├── backend/
+│   └── src/
+│       ├── config/
+│       ├── models/
+│       │   ├── Patient.js
+│       │   ├── Device.js
+│       │   ├── LocationEvent.js
+│       │   ├── SensorEvent.js
+│       │   └── Alert.js
+│       ├── routes/
+│       ├── controllers/
+│       ├── services/
+│       │   ├── sensor.service.js
+│       │   ├── location.service.js
+│       │   └── alert.service.js
+│       ├── middleware/
+│       ├── sockets/
+│       └── app.js
+└── frontend/
+    └── src/
+        ├── components/
+        ├── layouts/
+        ├── pages/
+        │   ├── Dashboard/
+        │   ├── Patients/
+        │   ├── LiveTracking/
+        │   ├── MovementHistory/
+        │   ├── Alerts/
+        │   └── Settings/
+        ├── hooks/
+        ├── services/
+        └── context/
