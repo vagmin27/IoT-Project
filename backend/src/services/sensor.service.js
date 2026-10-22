@@ -26,19 +26,34 @@ class SensorService {
     }
 
     // 2. Persist Sensor Event
-    const sensorEvent = await eventRepository.create({
-      deviceId,
-      patientId,
-      sequenceNumber,
-      timestamp: timestamp ? new Date(timestamp) : new Date(),
-      movementState,
-      metrics: {
-        accelMagnitude: metrics?.accelMagnitude ?? 1.0,
-        pitch: metrics?.pitch ?? 0,
-        roll: metrics?.roll ?? 0,
-      },
-      processed: true,
-    });
+    let sensorEvent;
+    try {
+      sensorEvent = await eventRepository.create({
+        deviceId,
+        patientId,
+        sequenceNumber,
+        timestamp: timestamp ? new Date(timestamp) : new Date(),
+        movementState,
+        metrics: {
+          accelMagnitude: metrics?.accelMagnitude ?? 1.0,
+          pitch: metrics?.pitch ?? 0,
+          roll: metrics?.roll ?? 0,
+        },
+        processed: true,
+      });
+    } catch (createErr) {
+      if (createErr.code === 11000) {
+        console.warn(`[SensorService] Duplicate event caught via unique index: deviceId=${deviceId}, sequence=${sequenceNumber}`);
+        const duplicateRecord = await eventRepository.findByDeviceAndSequence(deviceId, sequenceNumber);
+        return {
+          success: false,
+          duplicate: true,
+          message: 'Duplicate event sequence discarded',
+          event: duplicateRecord,
+        };
+      }
+      throw createErr;
+    }
 
     // 3. Fall Detection Evaluation
     const isFallImpact =

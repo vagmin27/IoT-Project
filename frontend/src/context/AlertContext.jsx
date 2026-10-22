@@ -10,19 +10,23 @@ export const AlertProvider = ({ children }) => {
   const [allAlerts, setAllAlerts] = useState([]);
   const [currentCriticalAlert, setCurrentCriticalAlert] = useState(null);
   const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(null);
   const { playEmergencyChime } = useAudioAlert();
 
   // Reconcile active alerts from REST API
   const refreshAlerts = useCallback(async () => {
     try {
+      setLoading(true);
       const [activeRes, allRes] = await Promise.all([
         apiClient.getActiveAlerts(),
         apiClient.getAllAlerts({ limit: 100 }),
       ]);
-      if (activeRes.success) setActiveAlerts(activeRes.data);
-      if (allRes.success) setAllAlerts(allRes.data);
+      if (activeRes && activeRes.success) setActiveAlerts(activeRes.data);
+      if (allRes && allRes.success) setAllAlerts(allRes.data);
+      setError(null);
     } catch (err) {
       console.error('[AlertContext] Failed to load alerts:', err);
+      setError(err.message || 'Network error or database unavailable');
     } finally {
       setLoading(false);
     }
@@ -32,7 +36,7 @@ export const AlertProvider = ({ children }) => {
     refreshAlerts();
 
     // Register reconciliation callback for SSE reconnection
-    sseClient.setReconnectCallback(() => {
+    const unsubReconnect = sseClient.addReconnectListener(() => {
       refreshAlerts();
     });
 
@@ -112,6 +116,7 @@ export const AlertProvider = ({ children }) => {
         allAlerts,
         currentCriticalAlert,
         loading,
+        error,
         refreshAlerts,
         acknowledgeAlert,
         resolveAlert,

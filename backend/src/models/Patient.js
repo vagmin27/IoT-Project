@@ -49,4 +49,9 @@ const PatientSchema = new mongoose.Schema(
   }
 );
 
+// Indexes for fast lookup by device and room/bed sorting
+PatientSchema.index({ assignedDeviceId: 1 }, { sparse: true });
+PatientSchema.index({ roomNumber: 1, bedNumber: 1 });
+
 module.exports = mongoose.model('Patient', PatientSchema);
+

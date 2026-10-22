@@ -3,10 +3,13 @@ import { Activity, ShieldAlert, Radio, User, History, Sliders, Bell } from 'luci
 import { sseClient } from '../services/sseClient';
 import { AudioAlertController } from './AudioAlertController';
 import { useAlerts } from '../context/AlertContext';
+import { usePatients } from '../context/PatientContext';
 
 export const Navbar = ({ activeTab, onTabChange }) => {
   const [sseStatus, setSseStatus] = useState('DISCONNECTED');
-  const { activeAlerts } = useAlerts();
+  const { activeAlerts, error: alertError } = useAlerts();
+  const { error: patientError } = usePatients();
+  const dbError = alertError || patientError;
 
   useEffect(() => {
     return sseClient.onStatusChange((status) => {
@@ -135,6 +138,28 @@ export const Navbar = ({ activeTab, onTabChange }) => {
 
         {/* Right Status Controls */}
         <div style={{ display: 'flex', alignItems: 'center', gap: '14px' }}>
+          {/* Database Connectivity Indicator if degraded */}
+          {dbError && (
+            <div
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                gap: '6px',
+                padding: '6px 10px',
+                borderRadius: 'var(--radius-full)',
+                background: 'rgba(239, 68, 68, 0.15)',
+                border: '1px solid rgba(239, 68, 68, 0.4)',
+                fontSize: '0.75rem',
+                fontWeight: 600,
+                color: '#f87171',
+              }}
+              title={`Database status: ${dbError}`}
+            >
+              <span style={{ width: 8, height: 8, borderRadius: '50%', backgroundColor: '#ef4444' }} />
+              <span>DB Unavailable</span>
+            </div>
+          )}
+
           {/* SSE Stream Status Indicator */}
           <div
             style={{

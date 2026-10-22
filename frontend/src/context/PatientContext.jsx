@@ -7,15 +7,21 @@ const PatientContext = createContext(null);
 export const PatientProvider = ({ children }) => {
   const [patients, setPatients] = useState([]);
   const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(null);
 
   const fetchPatients = useCallback(async () => {
     try {
+      setLoading(true);
       const res = await apiClient.getPatients();
-      if (res.success) {
+      if (res && res.success) {
         setPatients(res.data);
+        setError(null);
+      } else {
+        setError(res?.message || 'Database unavailable');
       }
     } catch (err) {
       console.error('[PatientContext] Failed to fetch patients:', err);
+      setError(err.message || 'Network error or database unavailable');
     } finally {
       setLoading(false);
     }
@@ -23,6 +29,12 @@ export const PatientProvider = ({ children }) => {
 
   useEffect(() => {
     fetchPatients();
+
+    // Reconcile patient roster on SSE reconnection
+    const unsubReconnect = sseClient.addReconnectListener(() => {
+      console.log('[PatientContext] SSE reconnection detected, refreshing patients...');
+      fetchPatients();
+    });
 
     // Listen for real-time movement status badge updates
     const unsubStatus = sseClient.on('patient_status_updated', (update) => {
@@ -41,12 +53,13 @@ export const PatientProvider = ({ children }) => {
     });
 
     return () => {
+      unsubReconnect();
       unsubStatus();
     };
   }, [fetchPatients]);
 
   return (
-    <PatientContext.Provider value={{ patients, loading, refreshPatients: fetchPatients }}>
+    <PatientContext.Provider value={{ patients, loading, error, refreshPatients: fetchPatients }}>
       {children}
     </PatientContext.Provider>
   );

@@ -1,7 +1,18 @@
 /**
  * Server-Sent Events (SSE) Manager
  * Manages active HTTP SSE connections, monotonic event IDs,
- * event replay buffers for reconnection recovery, and broadcasts.
+ * in-memory event replay buffers for reconnection recovery, and broadcasts.
+ *
+ * ARCHITECTURAL NOTES & REPLAY LIMITATIONS:
+ * - Event IDs are monotonically incrementing integers generated per broadcast.
+ * - The replay buffer is an IN-MEMORY circular buffer with a fixed window size
+ *   (default: 100 events).
+ * - It is designed for short, transient disconnections (e.g. WiFi handoffs, quick page reloads).
+ * - LIMITATION: It does NOT provide durable disk/database replay across process restarts.
+ *   If the backend server restarts or a client is offline for longer than 100 events,
+ *   missed events outside the in-memory window cannot be delivered via SSE replay.
+ * - In that eventuality, connected clients rely on active REST reconciliation
+ *   (GET /api/alerts/active and GET /api/patients) upon reconnection to establish ground truth.
  */
 class SSEManager {
   constructor() {

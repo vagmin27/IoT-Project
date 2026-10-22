@@ -7,7 +7,7 @@ import { apiClient } from '../../services/apiClient';
 import { AcknowledgeModal } from '../../components/AcknowledgeModal';
 
 export const Dashboard = () => {
-  const { patients, loading: patientsLoading } = usePatients();
+  const { patients, loading: patientsLoading, error: patientsError, refreshPatients } = usePatients();
   const { activeAlerts } = useAlerts();
   const [selectedAlert, setSelectedAlert] = useState(null);
   const [actionFeedback, setActionFeedback] = useState(null);
@@ -119,9 +119,24 @@ export const Dashboard = () => {
           </div>
         </div>
 
-        {patientsLoading ? (
+        {patientsError ? (
+          <div style={{ padding: '36px', textAlign: 'center', color: '#f87171' }}>
+            <AlertTriangle size={32} style={{ margin: '0 auto 10px auto', opacity: 0.8 }} />
+            <p style={{ fontWeight: 600 }}>Database Unavailable</p>
+            <p style={{ fontSize: '0.85rem', color: 'var(--text-secondary)', marginTop: '4px' }}>
+              {patientsError}
+            </p>
+            <button onClick={refreshPatients} className="btn btn-sm btn-primary" style={{ marginTop: '14px' }}>
+              Retry Connection
+            </button>
+          </div>
+        ) : patientsLoading ? (
           <div style={{ padding: '40px', textAlign: 'center', color: 'var(--text-muted)' }}>
             Loading ward telemetry...
+          </div>
+        ) : patients.length === 0 ? (
+          <div style={{ padding: '40px', textAlign: 'center', color: 'var(--text-muted)' }}>
+            No admitted patients currently found in Ward 3B database.
           </div>
         ) : (
           <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(320px, 1fr))', gap: '16px' }}>

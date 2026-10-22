@@ -95,4 +95,11 @@ export const apiClient = {
     const res = await fetch(`${BASE_URL}/events/history?${params.toString()}`);
     return await res.json();
   },
+
+  // Health and DB connectivity
+  async getHealth() {
+    const res = await fetch(`${BASE_URL}/health`);
+    return await res.json();
+  },
 };
+

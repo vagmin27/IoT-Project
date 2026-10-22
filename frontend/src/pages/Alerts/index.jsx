@@ -5,7 +5,7 @@ import { StatusBadge } from '../../components/StatusBadge';
 import { AcknowledgeModal } from '../../components/AcknowledgeModal';
 
 export const Alerts = () => {
-  const { allAlerts, refreshAlerts } = useAlerts();
+  const { allAlerts, loading, error, refreshAlerts } = useAlerts();
   const [filterStatus, setFilterStatus] = useState('ALL');
   const [modalData, setModalData] = useState(null);
 
@@ -49,7 +49,21 @@ export const Alerts = () => {
 
       {/* Alerts Table / Cards */}
       <div className="glass-panel" style={{ padding: '20px' }}>
-        {filtered.length === 0 ? (
+        {error ? (
+          <div style={{ padding: '36px', textAlign: 'center', color: '#f87171' }}>
+            <p style={{ fontWeight: 600 }}>Database Unavailable</p>
+            <p style={{ fontSize: '0.85rem', color: 'var(--text-secondary)', marginTop: '4px' }}>
+              {error}
+            </p>
+            <button onClick={refreshAlerts} className="btn btn-sm btn-primary" style={{ marginTop: '14px' }}>
+              Retry Connection
+            </button>
+          </div>
+        ) : loading ? (
+          <div style={{ padding: '40px', textAlign: 'center', color: 'var(--text-muted)' }}>
+            Loading alert records from database...
+          </div>
+        ) : filtered.length === 0 ? (
           <div style={{ padding: '48px', textAlign: 'center', color: 'var(--text-muted)' }}>
             No incident records found for filter: {filterStatus}
           </div>

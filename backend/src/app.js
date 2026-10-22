@@ -1,7 +1,7 @@
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
-const { connectDB } = require('./config/db');
+const { connectDB, getDBStatus } = require('./config/db');
 const { seedSyntheticData } = require('./services/seed.service');
 
 const patientRoutes = require('./routes/patient.routes');
@@ -28,12 +28,17 @@ if (process.env.NODE_ENV !== 'test') {
   });
 }
 
-// Health check endpoint
+// Health check endpoint distinguishing application health from database connectivity
 app.get('/api/health', (req, res) => {
-  res.json({
-    status: 'healthy',
+  const dbStatus = getDBStatus();
+  const isHealthy = dbStatus.connected;
+
+  res.status(isHealthy ? 200 : 503).json({
+    status: isHealthy ? 'healthy' : 'degraded',
+    application: 'healthy',
     timestamp: new Date().toISOString(),
     service: 'Hospital Mobility Backend (MERN)',
+    database: dbStatus,
   });
 });
 

@@ -28,25 +28,31 @@ import {
 const MovementHistoryView = () => {
   const [history, setHistory] = useState([]);
   const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(null);
 
-  useEffect(() => {
-    let isMounted = true;
+  const loadHistory = () => {
+    setLoading(true);
     apiClient
       .getTelemetryHistory(null, 50)
       .then((res) => {
-        if (isMounted && res && res.success) {
+        if (res && res.success) {
           setHistory(res.data);
+          setError(null);
+        } else {
+          setError(res?.message || 'Failed to load telemetry history');
         }
       })
       .catch((err) => {
         console.warn('[History] Could not load telemetry history:', err);
+        setError(err.message || 'Network error or database unavailable');
       })
       .finally(() => {
-        if (isMounted) setLoading(false);
+        setLoading(false);
       });
-    return () => {
-      isMounted = false;
-    };
+  };
+
+  useEffect(() => {
+    loadHistory();
   }, []);
 
   return (
@@ -62,7 +68,17 @@ const MovementHistoryView = () => {
       </div>
 
       <div className="glass-panel" style={{ padding: '20px', overflowX: 'auto' }}>
-        {loading ? (
+        {error ? (
+          <div style={{ padding: '36px', textAlign: 'center', color: '#f87171' }}>
+            <p style={{ fontWeight: 600 }}>Database Unavailable</p>
+            <p style={{ fontSize: '0.85rem', color: 'var(--text-secondary)', marginTop: '4px' }}>
+              {error}
+            </p>
+            <button onClick={loadHistory} className="btn btn-sm btn-primary" style={{ marginTop: '14px' }}>
+              Retry Loading
+            </button>
+          </div>
+        ) : loading ? (
           <div style={{ padding: '40px', textAlign: 'center', color: 'var(--text-muted)' }}>
             Loading movement history...
           </div>
@@ -117,7 +133,7 @@ const MovementHistoryView = () => {
 
 // Patient Roster View
 const PatientsView = () => {
-  const { patients, loading } = usePatients();
+  const { patients, loading, error, refreshPatients } = usePatients();
 
   return (
     <div style={{ maxWidth: '1440px', margin: '0 auto', padding: '24px', display: 'flex', flexDirection: 'column', gap: '20px' }}>
@@ -132,7 +148,17 @@ const PatientsView = () => {
       </div>
 
       <div className="glass-panel" style={{ padding: '24px' }}>
-        {loading ? (
+        {error ? (
+          <div style={{ padding: '36px', textAlign: 'center', color: '#f87171' }}>
+            <p style={{ fontWeight: 600 }}>Database Unavailable</p>
+            <p style={{ fontSize: '0.85rem', color: 'var(--text-secondary)', marginTop: '4px' }}>
+              {error}
+            </p>
+            <button onClick={refreshPatients} className="btn btn-sm btn-primary" style={{ marginTop: '14px' }}>
+              Retry Connection
+            </button>
+          </div>
+        ) : loading ? (
           <div style={{ padding: '40px', textAlign: 'center', color: 'var(--text-muted)' }}>
             Loading patient roster...
           </div>

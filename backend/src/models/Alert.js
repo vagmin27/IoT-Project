@@ -67,4 +67,9 @@ const AlertSchema = new mongoose.Schema(
   }
 );
 
+// Compound indexes for active alert queries and patient incident filtering
+AlertSchema.index({ status: 1, triggeredAt: -1 });
+AlertSchema.index({ patientId: 1, status: 1 });
+
 module.exports = mongoose.model('Alert', AlertSchema);
+

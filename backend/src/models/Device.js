@@ -34,4 +34,8 @@ const DeviceSchema = new mongoose.Schema(
   }
 );
 
+// Index for patient-device relationship lookups
+DeviceSchema.index({ assignedPatientId: 1 });
+
 module.exports = mongoose.model('Device', DeviceSchema);
+

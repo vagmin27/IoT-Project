@@ -4,7 +4,7 @@ node_modules/
 # Environment configurations
 .env
 .env.*
-!.env.example
+# !.env.example
 
 # npm debug logs
 npm-debug.log*

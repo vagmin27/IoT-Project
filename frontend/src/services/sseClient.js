@@ -11,7 +11,7 @@ class SSEClient {
     this.eventListeners = new Map(); // eventType -> Set of callbacks
     this.processedEventIds = new Set();
     this.reconnectTimeout = null;
-    this.onReconnectCallback = null;
+    this.reconnectListeners = new Set();
   }
 
   onStatusChange(callback) {
@@ -21,8 +21,19 @@ class SSEClient {
   }
 
   setStatus(newStatus) {
-    this.status = newStatus;
-    this.statusListeners.forEach((cb) => cb(newStatus));
+    if (this.status !== newStatus) {
+      this.status = newStatus;
+      this.statusListeners.forEach((cb) => cb(newStatus));
+    }
+  }
+
+  addReconnectListener(callback) {
+    this.reconnectListeners.add(callback);
+    return () => this.reconnectListeners.delete(callback);
+  }
+
+  setReconnectCallback(cb) {
+    return this.addReconnectListener(cb);
   }
 
   on(eventType, callback) {
@@ -34,10 +45,6 @@ class SSEClient {
       const set = this.eventListeners.get(eventType);
       if (set) set.delete(callback);
     };
-  }
-
-  setReconnectCallback(cb) {
-    this.onReconnectCallback = cb;
   }
 
   connect() {
@@ -55,16 +62,27 @@ class SSEClient {
       const wasDisconnected = this.status === 'DISCONNECTED' || this.status === 'CONNECTING';
       this.setStatus('CONNECTED');
 
-      // Reconcile active alerts on reconnection
-      if (wasDisconnected && this.onReconnectCallback) {
-        console.log('[SSE-Client] Reconnection detected, reconciling active alerts...');
-        this.onReconnectCallback();
+      // Reconcile active alerts and patient state on reconnection
+      if (wasDisconnected && this.reconnectListeners.size > 0) {
+        console.log('[SSE-Client] Reconnection detected, reconciling active state...');
+        this.reconnectListeners.forEach((cb) => {
+          try {
+            cb();
+          } catch (err) {
+            console.error('[SSE-Client] Error in reconnect callback:', err);
+          }
+        });
       }
     };
 
     this.eventSource.onerror = (err) => {
       console.warn('[SSE-Client] Connection error or interruption:', err);
-      this.setStatus('DISCONNECTED');
+      // Browser EventSource automatically attempts to reconnect
+      if (this.eventSource && this.eventSource.readyState === EventSource.CONNECTING) {
+        this.setStatus('CONNECTING');
+      } else {
+        this.setStatus('DISCONNECTED');
+      }
     };
 
     // Generic and custom event listeners

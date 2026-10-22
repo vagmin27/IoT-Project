@@ -54,5 +54,7 @@ const SensorEventSchema = new mongoose.Schema(
 
 // Compound index to guarantee idempotency and fast duplicate rejection
 SensorEventSchema.index({ deviceId: 1, sequenceNumber: 1 }, { unique: true });
+SensorEventSchema.index({ patientId: 1, timestamp: -1 });
 
 module.exports = mongoose.model('SensorEvent', SensorEventSchema);
+
