@@ -80,3 +80,11 @@ Thumbs.db
 !.vscode/tasks.json
 !.vscode/launch.json
 !.vscode/extensions.json
+
+# Gateway state & lock files
+*.state.json
+*.state.json.tmp
+*.lock
+.gateway-state.json
+.gateway-state.json.tmp
+.gateway.lock

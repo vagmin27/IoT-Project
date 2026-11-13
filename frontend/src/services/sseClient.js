@@ -1,4 +1,4 @@
-import { getAuthToken } from './apiClient';
+import { getAuthToken, API_HOST } from './apiClient';
 
 /**
  * Server-Sent Events (SSE) Client
@@ -109,7 +109,7 @@ class SSEClient {
     }
 
     this.setStatus('CONNECTING');
-    const streamUrl = `/api/events/stream?token=${encodeURIComponent(token)}`;
+    const streamUrl = `${API_HOST}/api/events/stream?token=${encodeURIComponent(token)}`;
     console.log('[SSE-Client] Connecting to authenticated stream...');
 
     this.eventSource = new EventSource(streamUrl, { withCredentials: true });

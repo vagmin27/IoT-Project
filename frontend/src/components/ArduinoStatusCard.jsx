@@ -17,7 +17,7 @@ export const ArduinoStatusCard = () => {
       setLoading(true);
       const [res, faultsRes] = await Promise.all([
         apiClient.getSerialStatus(),
-        apiClient.getSerialFaults().catch(() => ({ success: false, data: [] })),
+        apiClient.getSerialFaults('ARDUINO-PIEZO-01', true).catch(() => ({ success: false, data: [] })),
       ]);
       if (res && res.success) {
         setStatusData(res.data);
@@ -28,7 +28,10 @@ export const ArduinoStatusCard = () => {
         }
       }
       if (faultsRes && faultsRes.success && Array.isArray(faultsRes.data)) {
-        setActiveFaults(faultsRes.data);
+        const activeDeviceFaults = faultsRes.data.filter(
+          (f) => !f.recovered && f.deviceId === 'ARDUINO-PIEZO-01'
+        );
+        setActiveFaults(activeDeviceFaults);
       }
     } catch (err) {
       console.warn('[ArduinoStatusCard] Could not fetch serial status:', err.message);
@@ -98,17 +101,26 @@ export const ArduinoStatusCard = () => {
       setDiagnosticWarning(diag.message || 'Sensor diagnostic inspection required.');
     });
 
-    // Listen to hardware fault events
+    // Listen to hardware fault events (strictly requiring exact deviceId === 'ARDUINO-PIEZO-01')
     const unsubFault = sseClient.on('hardware_fault', (fault) => {
+      if (!fault || fault.deviceId !== 'ARDUINO-PIEZO-01') {
+        return;
+      }
       console.warn('[ArduinoStatusCard] SSE hardware_fault received:', fault);
-      setActiveFaults((prev) => [fault, ...prev.filter((f) => f._id !== fault._id)]);
+      setActiveFaults((prev) => [fault, ...prev.filter((f) => (f._id || f.id) !== (fault._id || fault.id))]);
     });
 
-    // Listen to hardware recovery events
-    const unsubRecovery = sseClient.on('hardware_recovered', (rec) => {
-      console.log('[ArduinoStatusCard] SSE hardware_recovered received:', rec);
+    // Listen to hardware recovery events (strictly requiring exact deviceId === 'ARDUINO-PIEZO-01')
+    const handleFaultRecovery = (rec) => {
+      if (!rec || rec.deviceId !== 'ARDUINO-PIEZO-01') {
+        return;
+      }
+      console.log('[ArduinoStatusCard] SSE hardware fault recovery received:', rec);
       setActiveFaults((prev) => prev.filter((f) => f.faultType !== rec.faultType));
-    });
+    };
+
+    const unsubRecovery = sseClient.on('hardware_fault_recovered', handleFaultRecovery);
+    const unsubLegacyRecovery = sseClient.on('hardware_recovered', handleFaultRecovery);
 
     return () => {
       unsubReconnect();
@@ -117,10 +129,15 @@ export const ArduinoStatusCard = () => {
       unsubDiagnostic();
       unsubFault();
       unsubRecovery();
+      unsubLegacyRecovery();
     };
   }, []);
 
   const handleReconnect = async () => {
+    if (statusData?.enabled === false) {
+      alert('The backend is running in cloud mode on Render. USB serial connection is managed locally via your laptop gateway terminal.');
+      return;
+    }
     try {
       setReconnecting(true);
       const res = await apiClient.reconnectSerial();
@@ -134,8 +151,12 @@ export const ArduinoStatusCard = () => {
     }
   };
 
-  const isConnected = statusData?.status === 'CONNECTED';
-  const isConnecting = statusData?.status === 'CONNECTING';
+  const isGatewayOnline = Boolean(statusData?.gateway?.connected);
+  const isArduinoConnected = isGatewayOnline
+    ? statusData?.gateway?.arduinoSerialStatus === 'CONNECTED'
+    : statusData?.status === 'CONNECTED';
+  const isSystemOnline = isArduinoConnected || (isGatewayOnline && Boolean(statusData?.lastReceivedAt));
+  const isConnecting = statusData?.status === 'CONNECTING' || statusData?.gateway?.arduinoSerialStatus === 'CONNECTING';
 
   return (
     <div
@@ -148,7 +169,7 @@ export const ArduinoStatusCard = () => {
         gap: '14px',
         border: diagnosticWarning
           ? '1.5px solid rgba(245, 158, 11, 0.6)'
-          : isConnected
+          : isSystemOnline
           ? '1px solid rgba(16, 185, 129, 0.3)'
           : '1px solid var(--border-subtle)',
         background: diagnosticWarning
@@ -164,13 +185,13 @@ export const ArduinoStatusCard = () => {
               width: 34,
               height: 34,
               borderRadius: 'var(--radius-sm)',
-              background: isConnected ? 'rgba(16, 185, 129, 0.15)' : 'rgba(100, 116, 139, 0.15)',
+              background: isSystemOnline ? 'rgba(16, 185, 129, 0.15)' : 'rgba(100, 116, 139, 0.15)',
               display: 'flex',
               alignItems: 'center',
               justifyContent: 'center',
             }}
           >
-            <Cpu size={18} color={isConnected ? '#10b981' : '#64748b'} />
+            <Cpu size={18} color={isSystemOnline ? '#10b981' : '#64748b'} />
           </div>
           <div>
             <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
@@ -202,13 +223,26 @@ export const ArduinoStatusCard = () => {
           {isAdmin && (
             <button
               onClick={handleReconnect}
-              disabled={reconnecting}
+              disabled={reconnecting || statusData?.enabled === false}
               className="btn btn-sm btn-secondary"
-              style={{ fontSize: '0.75rem', padding: '5px 10px' }}
-              title="Trigger USB port reconnect"
+              style={{
+                fontSize: '0.75rem',
+                padding: '5px 10px',
+                opacity: statusData?.enabled === false ? 0.6 : 1,
+                cursor: statusData?.enabled === false ? 'not-allowed' : 'pointer',
+              }}
+              title={
+                statusData?.enabled === false
+                  ? 'Cloud deployment mode: COM5 is managed via your local laptop gateway process.'
+                  : 'Trigger USB port reconnect'
+              }
             >
               <RefreshCw size={12} className={reconnecting ? 'animate-spin' : ''} />
-              {reconnecting ? 'Connecting...' : 'Reconnect USB'}
+              {reconnecting
+                ? 'Connecting...'
+                : statusData?.enabled === false
+                ? 'Cloud Gateway Active'
+                : 'Reconnect USB'}
             </button>
           )}
         </div>
@@ -228,7 +262,7 @@ export const ArduinoStatusCard = () => {
         {/* 1. Connection State */}
         <div>
           <span style={{ fontSize: '0.7rem', color: 'var(--text-muted)', display: 'block', fontWeight: 600 }}>
-            Serial Port Status
+            {statusData?.gateway ? 'Cloud Gateway & Serial Status' : 'Serial Port Status'}
           </span>
           <div style={{ display: 'flex', alignItems: 'center', gap: '6px', marginTop: '3px' }}>
             <span
@@ -236,20 +270,26 @@ export const ArduinoStatusCard = () => {
                 width: 8,
                 height: 8,
                 borderRadius: '50%',
-                backgroundColor: isConnected ? '#10b981' : isConnecting ? '#f59e0b' : '#ef4444',
+                backgroundColor: isSystemOnline ? '#10b981' : isConnecting ? '#f59e0b' : '#ef4444',
               }}
-              className={isConnected ? 'animate-pulse-emerald' : ''}
+              className={isSystemOnline ? 'animate-pulse-emerald' : ''}
             />
-            <strong style={{ color: isConnected ? '#10b981' : isConnecting ? '#f59e0b' : '#ef4444' }}>
-              {statusData?.status || 'DISCONNECTED'}
+            <strong style={{ color: isSystemOnline ? '#10b981' : isConnecting ? '#f59e0b' : '#ef4444' }}>
+              {isGatewayOnline
+                ? 'GATEWAY ONLINE'
+                : statusData?.enabled === false
+                ? 'GATEWAY OFFLINE'
+                : statusData?.status || 'DISCONNECTED'}
             </strong>
             <span style={{ color: 'var(--text-secondary)', fontFamily: 'var(--font-mono)', fontSize: '0.75rem' }}>
-              ({statusData?.port || 'COM5'})
+              ({isGatewayOnline
+                ? `${statusData?.gateway?.port || 'COM5'} • ${statusData?.gateway?.arduinoSerialStatus || 'CONNECTED'}`
+                : statusData?.port || 'COM5'})
             </span>
           </div>
         </div>
 
-        {/* 2. Last Telemetry Packet (Requirement 2: Timestamp, Sequence, Movement Count) */}
+        {/* 2. Last Telemetry Packet */}
         <div>
           <span style={{ fontSize: '0.7rem', color: 'var(--text-muted)', display: 'block', fontWeight: 600 }}>
             Last Telemetry Packet
@@ -274,7 +314,7 @@ export const ArduinoStatusCard = () => {
           </div>
         </div>
 
-        {/* 3. Last Movement Detected (Requirement 3: Distinct timestamp and count) */}
+        {/* 3. Last Movement Detected */}
         <div>
           <span style={{ fontSize: '0.7rem', color: 'var(--text-muted)', display: 'block', fontWeight: 600 }}>
             Last Movement Detected

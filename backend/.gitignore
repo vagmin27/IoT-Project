@@ -39,3 +39,11 @@ mongo-data/
 .Trashes
 ehthumbs.db
 Thumbs.db
+
+# Gateway state & lock files
+*.state.json
+*.state.json.tmp
+*.lock
+.gateway-state.json
+.gateway-state.json.tmp
+.gateway.lock

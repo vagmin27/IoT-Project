@@ -52,10 +52,25 @@ class SerialController {
    */
   async getFaults(req, res, next) {
     try {
-      const { deviceId, activeOnly } = req.query;
-      const faults = activeOnly === 'true'
-        ? await hardwareFaultService.getActiveFaults(deviceId)
-        : await hardwareFaultService.getFaultHistory(deviceId ? { deviceId } : {});
+      const deviceParam = req.query.deviceId;
+      const targetDeviceId = (deviceParam === 'ALL' || deviceParam === '*')
+        ? null
+        : (deviceParam || serialBridgeService.deviceCode || 'ARDUINO-PIEZO-01');
+      const isHistorical = req.query.activeOnly === 'false' || req.query.history === 'true';
+
+      // Validate limit: accept only valid positive integers, clamp to maximum of 500, default to 100
+      let limit = 100;
+      if (req.query.limit !== undefined) {
+        const parsed = Number(req.query.limit);
+        if (Number.isInteger(parsed) && parsed > 0) {
+          limit = Math.min(parsed, 500);
+        } else {
+          limit = 100;
+        }
+      }
+      const faults = isHistorical
+        ? await hardwareFaultService.getFaultHistory(targetDeviceId ? { deviceId: targetDeviceId } : {}, limit)
+        : await hardwareFaultService.getActiveFaults(targetDeviceId);
       res.json({ success: true, count: faults.length, data: faults });
     } catch (err) {
       next(err);

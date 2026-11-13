@@ -29,8 +29,13 @@ class SerialBridgeService {
     this.lastPiezoActivity = 'UNKNOWN'; // 'MOVEMENT_DETECTED' | 'NO_RECENT_MOVEMENT' | 'UNKNOWN'
     this.lastSensorStatus = null; // 'ACTIVE' | 'INACTIVE' | 'SENSOR_CHECK'
     this.lastDiagnostic = null;
+    this.gatewayWatchdogTimer = null;
+    this.gatewayWatchdogGeneration = 0;
+    this.gatewayWatchdogTimeoutMs = options.gatewayWatchdogTimeoutMs || 12000;
     this.reconnectTimer = null;
     this.packetWatchdogTimer = null;
+    this.packetWatchdogGeneration = 0;
+
     this.isStopped = false;
 
     this.stats = {
@@ -38,6 +43,16 @@ class SerialBridgeService {
       validPackets: 0,
       droppedPackets: 0,
       duplicatePackets: 0,
+    };
+
+    // Dedicated Laptop Gateway Tracking (distinct from server's local serial port)
+    this.gateway = {
+      connected: false,
+      lastSeen: null,
+      arduinoSerialStatus: 'DISCONNECTED',
+      port: null,
+      baudRate: null,
+      packetsForwarded: 0,
     };
   }
 
@@ -48,14 +63,21 @@ class SerialBridgeService {
     try {
       const existing = await deviceRepository.findByCode(this.deviceCode);
       if (!existing) {
+        let defaultPatientId = null;
+        try {
+          const Patient = require('../models/Patient');
+          const defaultPatient = await Patient.findOne({ name: { $regex: /Eleanor/i } });
+          if (defaultPatient) defaultPatientId = defaultPatient._id;
+        } catch {}
+
         await Device.create({
           deviceCode: this.deviceCode,
           batteryLevel: 100,
           status: 'ACTIVE',
-          assignedPatientId: null,
+          assignedPatientId: defaultPatientId,
           lastHeartbeat: new Date(),
         });
-        console.log(`[SerialBridge] Registered default device record for ${this.deviceCode}`);
+        console.log(`[SerialBridge] Registered default device record for ${this.deviceCode} (patient: ${defaultPatientId || 'unassigned'})`);
       }
     } catch (err) {
       console.warn(`[SerialBridge] Device registration check: ${err.message}`);
@@ -98,6 +120,10 @@ class SerialBridgeService {
   async start() {
     this.isStopped = false;
 
+    // Always ensure the device is registered in MongoDB and restore latest state on boot
+    await this.ensureDeviceRegistered();
+    await this.restoreLatestState();
+
     if (this.status === 'CONNECTED' || this.status === 'CONNECTING') {
       console.log(`[SerialBridge] Already ${this.status}. Ignoring start request.`);
       return this.getStatus();
@@ -109,8 +135,6 @@ class SerialBridgeService {
       return this.getStatus();
     }
 
-    await this.ensureDeviceRegistered();
-    await this.restoreLatestState();
     return await this.connect();
   }
 
@@ -148,14 +172,19 @@ class SerialBridgeService {
           this.lastError = null;
           console.log(`[SerialBridge] Successfully connected to Arduino on ${this.portName} @ ${this.baudRate} baud.`);
 
-          hardwareFaultService.recordRecovery(this.deviceCode, 'SERIAL_COMM_FAILURE', 'Serial port connected successfully');
-          hardwareFaultService.recordRecovery(this.deviceCode, 'SENSOR_DISCONNECTED', 'Serial port connected successfully');
+          hardwareFaultService.recordRecovery(this.deviceCode, 'SERIAL_COMM_FAILURE', 'Serial port connected successfully')
+            .catch((err) => console.error('[SerialBridge] Error recovering SERIAL_COMM_FAILURE on open:', err.message));
+
           this.resetPacketWatchdog();
 
           sseManager.broadcast('serial_status', this.getStatusPayload());
 
           this.parser = this.port.pipe(new this.ReadlineParserClass({ delimiter: '\r\n' }));
-          this.parser.on('data', (line) => this.handleIncomingLine(line));
+          this.parser.on('data', (line) => {
+            this.handleIncomingLine(line).catch((err) => {
+              console.error('[SerialBridge] Error handling incoming serial data:', err.message);
+            });
+          });
 
           this.port.on('close', (closeErr) => {
             console.warn(`[SerialBridge] Serial port ${this.portName} closed: ${closeErr ? closeErr.message : 'Clean close'}`);
@@ -166,7 +195,7 @@ class SerialBridgeService {
               faultType: 'SENSOR_DISCONNECTED',
               severity: 'CRITICAL',
               details: closeErr ? closeErr.message : 'Serial connection closed',
-            });
+            }).catch((err) => console.error('[SerialBridge] Error recording SENSOR_DISCONNECTED on close:', err.message));
             sseManager.broadcast('serial_status', this.getStatusPayload());
             if (!this.isStopped) {
               this.scheduleReconnect();
@@ -188,16 +217,32 @@ class SerialBridgeService {
 
   resetPacketWatchdog() {
     this.cleanupWatchdog();
-    this.packetWatchdogTimer = setTimeout(() => {
-      if (this.status === 'CONNECTED' && !this.isStopped) {
-        hardwareFaultService.recordFault({
-          deviceId: this.deviceCode,
-          faultType: 'MISSING_PACKETS',
-          severity: 'WARNING',
-          details: 'Telemetry packets stopped arriving (heartbeat timeout > 3500ms)',
-        });
+    const generation = ++this.packetWatchdogGeneration;
+
+    const timer = setTimeout(async () => {
+      if (
+        this.isStopped ||
+        this.packetWatchdogGeneration !== generation ||
+        this.packetWatchdogTimer !== timer
+      ) {
+        return;
+      }
+
+      if (this.status === 'CONNECTED') {
+        try {
+          await hardwareFaultService.recordFault({
+            deviceId: this.deviceCode,
+            faultType: 'MISSING_PACKETS',
+            severity: 'WARNING',
+            details: 'Telemetry packets stopped arriving (heartbeat timeout > 3500ms)',
+          });
+        } catch (err) {
+          console.error('[SerialBridge] Error recording packet watchdog fault:', err.message);
+        }
       }
     }, 3500);
+
+    this.packetWatchdogTimer = timer;
 
     if (this.packetWatchdogTimer.unref) {
       this.packetWatchdogTimer.unref();
@@ -205,9 +250,63 @@ class SerialBridgeService {
   }
 
   cleanupWatchdog() {
+    this.packetWatchdogGeneration++;
     if (this.packetWatchdogTimer) {
       clearTimeout(this.packetWatchdogTimer);
       this.packetWatchdogTimer = null;
+    }
+  }
+
+  resetGatewayWatchdog() {
+    this.cleanupGatewayWatchdog();
+    const generation = ++this.gatewayWatchdogGeneration;
+
+    const timer = setTimeout(async () => {
+      // Race protection: ignore if stopped or cancelled/superseded by a newer generation or timer
+      if (
+        this.isStopped ||
+        this.gatewayWatchdogGeneration !== generation ||
+        this.gatewayWatchdogTimer !== timer
+      ) {
+        return;
+      }
+
+      // Elapsed check: verify that gateway has indeed been silent for >= timeout
+      if (this.gateway.lastSeen) {
+        const elapsed = Date.now() - new Date(this.gateway.lastSeen).getTime();
+        if (elapsed < this.gatewayWatchdogTimeoutMs) {
+          return;
+        }
+      }
+
+      this.gateway.connected = false;
+
+      try {
+        await hardwareFaultService.recordFault({
+          deviceId: this.deviceCode,
+          faultType: 'MISSING_PACKETS',
+          severity: 'WARNING',
+          details: `Gateway heartbeat expired: Telemetry and heartbeats stopped arriving from laptop gateway (>${Math.round(this.gatewayWatchdogTimeoutMs / 1000)}s)`,
+        });
+      } catch (err) {
+        console.error('[SerialBridge] Error recording gateway expiration fault:', err.message);
+      }
+
+      sseManager.broadcast('gateway_status', this.getGatewayStatus());
+    }, this.gatewayWatchdogTimeoutMs);
+
+    this.gatewayWatchdogTimer = timer;
+
+    if (this.gatewayWatchdogTimer.unref) {
+      this.gatewayWatchdogTimer.unref();
+    }
+  }
+
+  cleanupGatewayWatchdog() {
+    this.gatewayWatchdogGeneration++;
+    if (this.gatewayWatchdogTimer) {
+      clearTimeout(this.gatewayWatchdogTimer);
+      this.gatewayWatchdogTimer = null;
     }
   }
 
@@ -221,7 +320,7 @@ class SerialBridgeService {
       faultType: 'SERIAL_COMM_FAILURE',
       severity: 'CRITICAL',
       details: errorMsg,
-    });
+    }).catch((fErr) => console.error('[SerialBridge] Error recording port error fault:', fErr.message));
     this.cleanupPort();
     sseManager.broadcast('serial_status', this.getStatusPayload());
 
@@ -274,10 +373,8 @@ class SerialBridgeService {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
     }
-    if (this.watchdogTimer) {
-      clearInterval(this.watchdogTimer);
-      this.watchdogTimer = null;
-    }
+    this.cleanupWatchdog();
+    this.cleanupGatewayWatchdog();
 
     return new Promise((resolve) => {
       if (this.port && this.port.isOpen) {
@@ -315,6 +412,7 @@ class SerialBridgeService {
    * Core line parser and message router
    */
   async handleIncomingLine(rawLine) {
+    if (this.isStopped) return null;
     if (!rawLine || typeof rawLine !== 'string') return null;
 
     const line = rawLine.trim();
@@ -335,7 +433,7 @@ class SerialBridgeService {
 
       if (line.includes('SENSOR_SIGNAL_CHECK_REQUIRED')) {
         this.lastSensorStatus = 'SENSOR_CHECK';
-        hardwareFaultService.recordFault({
+        await hardwareFaultService.recordFault({
           deviceId: this.deviceCode,
           faultType: 'SENSOR_SATURATED',
           severity: 'WARNING',
@@ -347,7 +445,9 @@ class SerialBridgeService {
           timestamp: new Date(),
         });
       } else if (line.includes('SENSOR_READY')) {
-        hardwareFaultService.recordRecovery(this.deviceCode, 'SENSOR_SATURATED', 'Sensor returned to normal voltage');
+        // Firmware emits SENSOR_READY when upper-rail saturation is absent (recovering from SENSOR_SATURATED).
+        // Firmware does not perform physical continuity/presence validation, so SENSOR_DISCONNECTED is not recovered here.
+        await hardwareFaultService.recordRecovery(this.deviceCode, 'SENSOR_SATURATED', 'Sensor returned to normal operating voltage');
       }
       return null;
     }
@@ -408,7 +508,7 @@ class SerialBridgeService {
     ) {
       console.warn(`[SerialBridge] Discarded packet with invalid numeric data: ${line}`);
       this.stats.droppedPackets += 1;
-      hardwareFaultService.recordFault({
+      await hardwareFaultService.recordFault({
         deviceId: this.deviceCode,
         faultType: 'INVALID_READINGS',
         severity: 'WARNING',
@@ -417,19 +517,18 @@ class SerialBridgeService {
       return null;
     }
 
-    // Check for out-of-range ADC reading
+    // Check for out-of-range ADC reading (0-1023 for 10-bit ADC)
     if (raw < 0 || raw > 1023) {
-      hardwareFaultService.recordFault({
+      console.warn(`[SerialBridge] Discarded packet with out-of-range ADC value (${raw}): ${line}`);
+      this.stats.droppedPackets += 1;
+      await hardwareFaultService.recordFault({
         deviceId: this.deviceCode,
         faultType: 'INVALID_READINGS',
         severity: 'WARNING',
         details: `ADC raw value out of 10-bit range: ${raw}`,
       });
+      return null;
     }
-
-    // Heartbeat packet received: recover missing packets fault and reset watchdog
-    this.resetPacketWatchdog();
-    hardwareFaultService.recordRecovery(this.deviceCode, 'MISSING_PACKETS', 'Heartbeat telemetry stream active');
 
     // Validate enums
     const event = rawEvent.trim().toUpperCase();
@@ -447,6 +546,12 @@ class SerialBridgeService {
       return null;
     }
 
+    // Valid telemetry packet received: recover missing packets fault and reset watchdog
+    this.resetPacketWatchdog();
+    await hardwareFaultService.recordRecovery(this.deviceCode, 'MISSING_PACKETS', 'Fresh telemetry data received from Arduino');
+    await hardwareFaultService.recordRecovery(this.deviceCode, 'INVALID_READINGS', 'Valid numeric telemetry readings received and verified');
+    await hardwareFaultService.recordRecovery(this.deviceCode, 'SERIAL_COMM_FAILURE', 'Valid telemetry successfully received from Arduino');
+
     // Check duplicate sequence number
     const existing = await piezoEventRepository.findByDeviceAndSequence(this.deviceCode, sequenceNumber);
     if (existing) {
@@ -455,10 +560,14 @@ class SerialBridgeService {
       return { duplicate: true };
     }
 
-    // Look up device and associated patient
+    // Look up device and associated patient (with defensive registration guarantee)
     let device = null;
     try {
       device = await deviceRepository.findByCode(this.deviceCode);
+      if (!device) {
+        await this.ensureDeviceRegistered();
+        device = await deviceRepository.findByCode(this.deviceCode);
+      }
     } catch {}
 
     const patientId = device?.assignedPatientId
@@ -579,6 +688,72 @@ class SerialBridgeService {
     };
   }
 
+  async recordGatewayTelemetry({ arduinoSerialStatus = 'CONNECTED', port = 'COM5', baudRate = 9600 } = {}) {
+    if (this.isStopped) return;
+    const wasConnected = this.isGatewayAlive();
+    this.gateway.connected = true;
+    this.gateway.lastSeen = new Date();
+    this.gateway.arduinoSerialStatus = arduinoSerialStatus;
+    this.gateway.port = port;
+    this.gateway.baudRate = baudRate;
+    this.gateway.packetsForwarded += 1;
+
+    this.resetGatewayWatchdog();
+
+    if (arduinoSerialStatus === 'CONNECTED') {
+      await hardwareFaultService.recordRecovery(this.deviceCode, 'SERIAL_COMM_FAILURE', 'Serial communication operational via gateway bridge');
+    }
+
+    if (!wasConnected) {
+      sseManager.broadcast('gateway_status', this.getGatewayStatus());
+    }
+  }
+
+  async recordGatewayHeartbeat({ arduinoSerialStatus, port, baudRate } = {}) {
+    if (this.isStopped) return;
+    this.gateway.connected = true;
+    this.gateway.lastSeen = new Date();
+    if (arduinoSerialStatus) this.gateway.arduinoSerialStatus = arduinoSerialStatus;
+    if (port) this.gateway.port = port;
+    if (baudRate) this.gateway.baudRate = baudRate;
+
+    this.resetGatewayWatchdog();
+
+    if (arduinoSerialStatus === 'CONNECTED') {
+      await hardwareFaultService.recordRecovery(this.deviceCode, 'SERIAL_COMM_FAILURE', 'Serial communication operational via gateway bridge');
+      // NOTE: A gateway heartbeat confirms the gateway process is online, but does NOT prove
+      // Arduino telemetry is arriving. MISSING_PACKETS is ONLY recovered when a valid DATA packet is processed.
+    } else if (arduinoSerialStatus === 'DISCONNECTED' || arduinoSerialStatus === 'ERROR') {
+      await hardwareFaultService.recordFault({
+        deviceId: this.deviceCode,
+        faultType: 'SERIAL_COMM_FAILURE',
+        severity: 'CRITICAL',
+        details: `Gateway reported Arduino serial status: ${arduinoSerialStatus} on ${port || this.gateway.port || 'COM5'}`,
+      });
+    }
+
+    sseManager.broadcast('gateway_status', this.getGatewayStatus());
+  }
+
+  isGatewayAlive() {
+    if (!this.gateway.lastSeen || this.gateway.connected === false) return false;
+    const diffMs = Date.now() - new Date(this.gateway.lastSeen).getTime();
+    return diffMs < this.gatewayWatchdogTimeoutMs;
+  }
+
+  getGatewayStatus() {
+    const alive = this.isGatewayAlive();
+    this.gateway.connected = alive;
+    return {
+      connected: alive,
+      lastSeen: this.gateway.lastSeen,
+      arduinoSerialStatus: alive ? this.gateway.arduinoSerialStatus : 'DISCONNECTED',
+      port: this.gateway.port || 'COM5',
+      baudRate: this.gateway.baudRate || 9600,
+      packetsForwarded: this.gateway.packetsForwarded,
+    };
+  }
+
   async getStatus() {
     let assignedPatient = null;
     try {
@@ -615,6 +790,7 @@ class SerialBridgeService {
       lastDiagnostic: this.lastDiagnostic,
       stats: { ...this.stats },
       lastError: this.lastError,
+      gateway: this.getGatewayStatus(),
     };
   }
 

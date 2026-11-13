@@ -6,7 +6,10 @@
   "scripts": {
     "start": "node src/app.js",
     "dev": "node --watch src/app.js",
-    "test": "jest --runInBand --detectOpenHandles --forceExit"
+    "test": "jest --runInBand --detectOpenHandles --forceExit",
+    "gateway": "node gateway/serial-cloud-bridge.js",
+    "gateway:mock": "node gateway/serial-cloud-bridge.js --mock",
+    "gateway:verify": "node gateway/serial-cloud-bridge.js --verify-only"
   },
   "dependencies": {
     "@serialport/parser-readline": "^13.0.0",
