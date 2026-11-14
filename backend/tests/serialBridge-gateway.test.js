@@ -242,4 +242,71 @@ describe('SerialBridge & Gateway Integration Unit Tests', () => {
       expect(status.gateway.packetsForwarded).toBeGreaterThan(0);
     });
   });
+
+  describe('5. Local Serial Sequence Translation (Arduino counter reset vs stored history)', () => {
+    const hardwareFaultService = require('../src/services/hardwareFault.service');
+    const { SerialBridgeService } = require('../src/services/serialBridge.service');
+
+    it('re-anchors raw Arduino sequences after the highest stored sequence so MOVEMENT is not discarded as a duplicate', async () => {
+      // Historical record with the same raw sequence number from an earlier session
+      mockPiezoEvents.set('ARDUINO-PIEZO-01-7', { _id: 'old-7', deviceId: 'ARDUINO-PIEZO-01', sequenceNumber: 7, event: 'NONE' });
+
+      const bridge = new SerialBridgeService();
+      bridge.highestSequenceNumber = 10026; // as restored from MongoDB on boot
+      bridge.localSeq.rebootPending = true; // port just opened
+
+      const t1 = bridge.translateLocalSerialLine('DATA,7,7000,219,67.0,152,150.0,1,MOVEMENT,ACTIVE');
+      expect(t1.rawSeq).toBe(7);
+      expect(t1.line).toBe('DATA,10027,7000,219,67.0,152,150.0,1,MOVEMENT,ACTIVE');
+
+      const res = await bridge.handleIncomingLine(t1.line, { arduinoSequenceNumber: t1.rawSeq });
+      expect(res.success).toBe(true);
+      expect(res.event.sequenceNumber).toBe(10027);
+      expect(res.event.arduinoSequenceNumber).toBe(7);
+      expect(res.event.event).toBe('MOVEMENT');
+      expect(bridge.lastSequenceNumber).toBe(10027);
+      expect(bridge.lastArduinoSequenceNumber).toBe(7);
+      expect(bridge.lastMovementCount).toBe(1);
+      expect(bridge.lastPiezoActivity).toBe('MOVEMENT_DETECTED');
+
+      const telemetryCall = sseManager.broadcast.mock.calls.find(([evt]) => evt === 'piezo_telemetry');
+      expect(telemetryCall[1]).toMatchObject({ deviceId: 'ARDUINO-PIEZO-01', sequenceNumber: 10027, arduinoSequenceNumber: 7, event: 'MOVEMENT', movementCount: 1 });
+
+      // Subsequent packets in the same session stay contiguous
+      expect(bridge.translateLocalSerialLine('DATA,8,8000,60,67.0,7,150.0,1,NONE,ACTIVE').line.split(',')[1]).toBe('10028');
+      // Same raw sequence repeated without a reboot maps to the same global sequence (duplicate)
+      expect(bridge.translateLocalSerialLine('DATA,8,8000,60,67.0,7,150.0,1,NONE,ACTIVE').line.split(',')[1]).toBe('10028');
+      // Arduino reboot (raw sequence goes backwards) re-anchors above the highest assigned sequence
+      expect(bridge.translateLocalSerialLine('DATA,0,0,60,67.0,7,150.0,0,NONE,ACTIVE').line.split(',')[1]).toBe('10029');
+    });
+
+    it('leaves non-DATA lines untouched and flags reboot on firmware startup markers', () => {
+      const bridge = new SerialBridgeService();
+      bridge.localSeq.rebootPending = false;
+      expect(bridge.translateLocalSerialLine('TYPE,SEQUENCE,TIME_MS').line).toBe('TYPE,SEQUENCE,TIME_MS');
+      expect(bridge.translateLocalSerialLine('SYSTEM: CALIBRATION_STARTED').rawSeq).toBeNull();
+      expect(bridge.localSeq.rebootPending).toBe(true);
+    });
+
+    it('does not preserve a NONE packet as a new movement timestamp', async () => {
+      const bridge = new SerialBridgeService();
+      bridge.highestSequenceNumber = 50;
+      const move = bridge.translateLocalSerialLine('DATA,1,1000,219,67.0,152,150.0,1,MOVEMENT,ACTIVE');
+      await bridge.handleIncomingLine(move.line, { arduinoSequenceNumber: move.rawSeq });
+      const movementAt = bridge.lastMovementDetectedAt;
+      const none = bridge.translateLocalSerialLine('DATA,2,2000,60,67.0,7,150.0,1,NONE,ACTIVE');
+      await bridge.handleIncomingLine(none.line, { arduinoSequenceNumber: none.rawSeq });
+      expect(bridge.lastMovementDetectedAt).toBe(movementAt);
+      expect(bridge.lastSequenceNumber).toBe(52);
+    });
+
+    it('recovers SENSOR_DISCONNECTED only after valid non-SENSOR_CHECK telemetry is persisted', async () => {
+      const bridge = new SerialBridgeService();
+      await bridge.handleIncomingLine('DATA,900,1000,1020,45.0,975,30.0,0,NONE,SENSOR_CHECK');
+      expect(hardwareFaultService.recordRecovery).not.toHaveBeenCalledWith('ARDUINO-PIEZO-01', 'SENSOR_DISCONNECTED', expect.anything());
+
+      await bridge.handleIncomingLine('DATA,901,2000,60,45.0,15,30.0,0,NONE,ACTIVE');
+      expect(hardwareFaultService.recordRecovery).toHaveBeenCalledWith('ARDUINO-PIEZO-01', 'SENSOR_DISCONNECTED', expect.stringContaining('#901'));
+    });
+  });
 });

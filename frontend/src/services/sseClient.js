@@ -78,6 +78,13 @@ class SSEClient {
           }
         }
 
+        if (eventType === 'piezo_telemetry' && data && data.event === 'MOVEMENT') {
+          // [DIAG 5/6] Frontend SSE event received
+          console.log(
+            `[SSE-Client] [MOVEMENT] [5/6 SSE RECEIVED] id=${eventId} device=${data.deviceId} seq=${data.sequenceNumber} arduinoSeq=${data.arduinoSequenceNumber ?? 'n/a'} count=${data.movementCount} event=${data.event} ts=${data.timestamp}`
+          );
+        }
+
         const listeners = this.eventListeners.get(eventType);
         if (listeners && listeners.size > 0) {
           listeners.forEach((cb) => {
@@ -116,6 +123,11 @@ class SSEClient {
 
     this.eventSource.onopen = () => {
       console.log('[SSE-Client] SSE stream open and connected.');
+      // Server event IDs are per-process counters that restart at 1 when the backend restarts.
+      // Clear the dedupe cache on every (re)open so fresh events are not dropped as "duplicates"
+      // of IDs seen from the previous backend process. Replay after reconnect only sends IDs
+      // greater than Last-Event-ID, so this does not cause double delivery.
+      this.processedEventIds.clear();
       const wasDisconnected = this.status === 'DISCONNECTED' || this.status === 'CONNECTING';
       this.setStatus('CONNECTED');
 

@@ -18,6 +18,12 @@ const PiezoEventSchema = new mongoose.Schema(
       required: true,
       index: true,
     },
+    // Raw firmware SEQUENCE value (resets on Arduino reboot). sequenceNumber above is the
+    // translated, monotonic per-device sequence. Null for records forwarded by the gateway.
+    arduinoSequenceNumber: {
+      type: Number,
+      default: null,
+    },
     arduinoTimeMs: {
       type: Number,
       required: true,

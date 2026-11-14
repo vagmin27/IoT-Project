@@ -50,15 +50,26 @@ const resolveTargetUri = (uriOverride) => {
     if (process.env.TEST_MONGODB_URI) {
       return process.env.TEST_MONGODB_URI;
     }
-    // Isolate by appending _test or replacing database name
-    try {
-      const parsed = new URL(baseUri.replace('mongodb://', 'http://').replace('mongodb+srv://', 'http://'));
-      const originalDb = parsed.pathname.replace(/^\//, '') || 'hospital_mobility';
-      const testDb = originalDb.endsWith('_test') ? originalDb : `${originalDb}_test`;
-      return baseUri.replace(`/${originalDb}`, `/${testDb}`);
-    } catch {
-      return baseUri;
+    // Isolate by appending _test or inserting a test database name.
+    // Parsed manually (not with URL) so multi-host replica-set URIs and URIs with
+    // no database path (e.g. "host1,host2/?replicaSet=...") are handled. Never
+    // fall back to the production URI: tests delete collections.
+    const queryIdx = baseUri.indexOf('?');
+    const base = queryIdx === -1 ? baseUri : baseUri.slice(0, queryIdx);
+    const query = queryIdx === -1 ? '' : baseUri.slice(queryIdx);
+    const schemeEnd = base.indexOf('://');
+    if (schemeEnd === -1) {
+      throw new Error('[MongoDB] Refusing to run tests: cannot derive an isolated test database from MONGODB_URI. Set TEST_MONGODB_URI.');
     }
+    const slashIdx = base.indexOf('/', schemeEnd + 3);
+    const hosts = slashIdx === -1 ? base : base.slice(0, slashIdx);
+    const originalDb = slashIdx === -1 ? '' : base.slice(slashIdx + 1);
+    const testDb = !originalDb
+      ? 'hospital_mobility_test'
+      : originalDb.endsWith('_test')
+      ? originalDb
+      : `${originalDb}_test`;
+    return `${hosts}/${testDb}${query}`;
   }
 
   return baseUri;
@@ -106,5 +117,6 @@ module.exports = {
   isDBConnected,
   getDBStatus,
   sanitizeUri,
+  resolveTargetUri,
 };
 

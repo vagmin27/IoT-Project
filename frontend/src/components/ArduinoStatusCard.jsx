@@ -56,8 +56,12 @@ export const ArduinoStatusCard = () => {
 
     // Listen to real-time piezo telemetry packets (DATA records)
     const unsubTelemetry = sseClient.on('piezo_telemetry', (telemetry) => {
-      setStatusData((prev) => {
-        if (!prev) return prev;
+      if (telemetry && telemetry.deviceId && telemetry.deviceId !== 'ARDUINO-PIEZO-01') {
+        return;
+      }
+      setStatusData((prevState) => {
+        // Do not drop live telemetry if the initial REST fetch has not completed or failed
+        const prev = prevState || {};
 
         const isMovement = telemetry.event === 'MOVEMENT' && telemetry.status === 'ACTIVE';
         const isInactive = telemetry.event === 'INACTIVITY' && telemetry.status === 'INACTIVE';
@@ -83,6 +87,7 @@ export const ArduinoStatusCard = () => {
           ...prev,
           lastReceivedAt: telemetry.timestamp || new Date().toISOString(),
           lastSequenceNumber: telemetry.sequenceNumber,
+          lastArduinoSequenceNumber: telemetry.arduinoSequenceNumber ?? null,
           lastMovementCount: telemetry.movementCount !== undefined ? telemetry.movementCount : prev.lastMovementCount,
           lastMovementDetectedAt: newMovementDetectedAt,
           lastPiezoActivity: newActivity,
@@ -137,6 +142,14 @@ export const ArduinoStatusCard = () => {
       unsubLegacyRecovery();
     };
   }, []);
+
+  // [DIAG 6/6] React state updated (logged once per committed movement-state change)
+  useEffect(() => {
+    if (!statusData || !statusData.lastMovementDetectedAt) return;
+    console.log(
+      `[ArduinoStatusCard] [MOVEMENT] [6/6 STATE UPDATED] device=${statusData.deviceCode || 'ARDUINO-PIEZO-01'} seq=${statusData.lastSequenceNumber} arduinoSeq=${statusData.lastArduinoSequenceNumber ?? 'n/a'} count=${statusData.lastMovementCount} activity=${statusData.lastPiezoActivity} lastMovementDetectedAt=${statusData.lastMovementDetectedAt}`
+    );
+  }, [statusData?.lastMovementDetectedAt, statusData?.lastMovementCount]);
 
   const handleReconnect = async () => {
     if (statusData?.enabled === false) {
@@ -309,7 +322,10 @@ export const ArduinoStatusCard = () => {
               </span>
               {statusData?.lastSequenceNumber !== null && statusData?.lastSequenceNumber !== undefined && (
                 <span style={{ fontSize: '0.7rem', color: 'var(--text-muted)', fontFamily: 'var(--font-mono)' }}>
-                  (Seq #{statusData.lastSequenceNumber})
+                  (Seq #{statusData.lastSequenceNumber}
+                  {statusData.lastArduinoSequenceNumber !== null && statusData.lastArduinoSequenceNumber !== undefined
+                    ? ` · Arduino #${statusData.lastArduinoSequenceNumber}`
+                    : ''})
                 </span>
               )}
             </div>

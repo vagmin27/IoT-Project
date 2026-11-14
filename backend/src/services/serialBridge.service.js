@@ -7,6 +7,12 @@ const Device = require('../models/Device');
 const sseManager = require('../sockets/sse.manager');
 const hardwareFaultService = require('./hardwareFault.service');
 
+const isoOrNull = (d) => {
+  if (!d) return null;
+  const date = new Date(d);
+  return isNaN(date.getTime()) ? null : date.toISOString();
+};
+
 class SerialBridgeService {
   constructor(options = {}) {
     this.SerialPortClass = options.SerialPort || SerialPort;
@@ -24,6 +30,12 @@ class SerialBridgeService {
     this.lastError = null;
     this.lastReceivedAt = null;
     this.lastSequenceNumber = null;
+    this.lastArduinoSequenceNumber = null; // raw firmware sequence (resets to 0 on Arduino reboot)
+    this.highestSequenceNumber = -1; // highest stored global sequence for this device
+    // Local direct-serial sequence translation state (mirrors gateway/sequence-manager.js).
+    // The Arduino restarts its SEQUENCE counter at 0 on every reboot / COM port open, but
+    // PiezoEvent has a unique (deviceId, sequenceNumber) index shared with gateway history.
+    this.localSeq = { lastRaw: -1, offset: 0, rebootPending: true };
     this.lastMovementCount = 0;
     this.lastMovementDetectedAt = null;
     this.lastPiezoActivity = 'UNKNOWN'; // 'MOVEMENT_DETECTED' | 'NO_RECENT_MOVEMENT' | 'UNKNOWN'
@@ -93,6 +105,8 @@ class SerialBridgeService {
       if (latest) {
         this.lastReceivedAt = latest.timestamp;
         this.lastSequenceNumber = latest.sequenceNumber;
+        this.highestSequenceNumber = Math.max(this.highestSequenceNumber, latest.sequenceNumber);
+        this.lastArduinoSequenceNumber = latest.arduinoSequenceNumber ?? null;
         this.lastMovementCount = latest.movementCount;
         this.lastSensorStatus = latest.status;
         if (latest.status === 'ACTIVE') {
@@ -177,11 +191,16 @@ class SerialBridgeService {
 
           this.resetPacketWatchdog();
 
+          // Opening the port resets the Arduino (DTR), so its SEQUENCE counter restarts at 0.
+          this.localSeq.rebootPending = true;
+          this.localSeq.lastRaw = -1;
+
           sseManager.broadcast('serial_status', this.getStatusPayload());
 
           this.parser = this.port.pipe(new this.ReadlineParserClass({ delimiter: '\r\n' }));
           this.parser.on('data', (line) => {
-            this.handleIncomingLine(line).catch((err) => {
+            const translated = this.translateLocalSerialLine(line);
+            this.handleIncomingLine(translated.line, { arduinoSequenceNumber: translated.rawSeq }).catch((err) => {
               console.error('[SerialBridge] Error handling incoming serial data:', err.message);
             });
           });
@@ -409,9 +428,65 @@ class SerialBridgeService {
   }
 
   /**
-   * Core line parser and message router
+   * Translate a raw line read directly from the local serial port into the device's
+   * global, monotonic sequence namespace (same scheme as gateway/sequence-manager.js).
+   * Lines arriving via the laptop gateway are already translated and must not go through this.
+   * Non-DATA lines are returned unchanged.
    */
-  async handleIncomingLine(rawLine) {
+  translateLocalSerialLine(rawLine) {
+    if (!rawLine || typeof rawLine !== 'string') return { line: rawLine, rawSeq: null };
+    const line = rawLine.trim();
+
+    if (
+      line.includes('HOSPITAL_MOBILITY') ||
+      line.includes('CALIBRATION_STARTED') ||
+      line.includes('CALIBRATION_COMPLETED') ||
+      line.includes('SENSOR_READY')
+    ) {
+      this.localSeq.rebootPending = true;
+      return { line, rawSeq: null };
+    }
+
+    if (!line.startsWith('DATA,') || line.startsWith('DATA,SEQUENCE')) return { line, rawSeq: null };
+
+    const parts = line.split(',');
+    if (parts.length !== 10) return { line, rawSeq: null };
+    const rawSeq = parseInt(parts[1], 10);
+    if (isNaN(rawSeq) || rawSeq < 0) return { line, rawSeq: null };
+
+    const highest = this.highestSequenceNumber;
+    const st = this.localSeq;
+    let globalSeq;
+
+    if (st.lastRaw >= 0 && rawSeq === st.lastRaw && !st.rebootPending) {
+      // Repeated raw sequence without reboot: map to the same global sequence so it is rejected as a duplicate
+      globalSeq = st.offset + rawSeq;
+    } else {
+      if (st.rebootPending || (st.lastRaw >= 0 && rawSeq < st.lastRaw)) {
+        st.offset = highest >= 0 ? highest + 1 - rawSeq : 0;
+        st.rebootPending = false;
+        console.log(`[SerialBridge] [SEQ] Arduino sequence reset detected (raw #${rawSeq}); re-anchoring after stored sequence #${highest} -> global #${st.offset + rawSeq}`);
+      }
+      globalSeq = st.offset + rawSeq;
+      if (globalSeq <= highest) {
+        st.offset = highest + 1 - rawSeq;
+        globalSeq = highest + 1;
+      }
+      this.highestSequenceNumber = Math.max(highest, globalSeq);
+    }
+
+    st.lastRaw = rawSeq;
+    parts[1] = String(globalSeq);
+    return { line: parts.join(','), rawSeq };
+  }
+
+  /**
+   * Core line parser and message router
+   * @param {string} rawLine
+   * @param {{ arduinoSequenceNumber?: number|null }} meta - raw firmware sequence when the line came from the local port
+   */
+  async handleIncomingLine(rawLine, meta = {}) {
+    const arduinoSequenceNumber = Number.isInteger(meta.arduinoSequenceNumber) ? meta.arduinoSequenceNumber : null;
     if (this.isStopped) return null;
     if (!rawLine || typeof rawLine !== 'string') return null;
 
@@ -547,10 +622,12 @@ class SerialBridgeService {
     }
 
     // ── DIAGNOSTIC: Per-packet log with RAW | BASELINE | DEVIATION | THRESHOLD | EVENT | MOVEMENT_COUNT ──
-    console.log(`[SerialBridge] [DATA] RAW=${raw} | BASELINE=${baseline.toFixed(2)} | DEVIATION=${deviation} | THRESHOLD=${threshold.toFixed(2)} | EVENT=${event} | MOVEMENT_COUNT=${movementCount} | STATUS=${status} | Seq=${sequenceNumber}`);
+    const arduinoSeqLabel = arduinoSequenceNumber !== null ? ` | ArduinoSeq=${arduinoSequenceNumber}` : '';
+    const source = arduinoSequenceNumber !== null ? 'local serial port' : 'gateway/API';
+    console.log(`[SerialBridge] [DATA] RAW=${raw} | BASELINE=${baseline.toFixed(2)} | DEVIATION=${deviation} | THRESHOLD=${threshold.toFixed(2)} | EVENT=${event} | MOVEMENT_COUNT=${movementCount} | STATUS=${status} | Seq=${sequenceNumber}${arduinoSeqLabel}`);
     if (event === 'MOVEMENT') {
-      console.log(`[SerialBridge] [MOVEMENT] >>> MOVEMENT EVENT received from gateway (Seq #${sequenceNumber}, Count=${movementCount}) RAW=${raw} DEV=${deviation} <<<`);
-      console.log(`[SerialBridge] [MOVEMENT]     Stage: Gateway -> API -> MongoDB (saving...) -> SSE -> Dashboard`);
+      // [DIAG 1/6] MOVEMENT received
+      console.log(`[SerialBridge] [MOVEMENT] [1/6 RECEIVED] source=${source} device=${this.deviceCode} seq=${sequenceNumber}${arduinoSeqLabel} count=${movementCount} event=${event} ts=${new Date().toISOString()}`);
     }
     // ──────────────────────────────────────────────────────────────────────────────────────────────────────
 
@@ -563,7 +640,7 @@ class SerialBridgeService {
     // Check duplicate sequence number
     const existing = await piezoEventRepository.findByDeviceAndSequence(this.deviceCode, sequenceNumber);
     if (existing) {
-      console.warn(`[SerialBridge] Duplicate sequence ${sequenceNumber} discarded for device ${this.deviceCode}`);
+      console.warn(`[SerialBridge] Duplicate sequence ${sequenceNumber} discarded for device ${this.deviceCode} (event=${event}; existing record ${existing._id} event=${existing.event} stored at ${isoOrNull(existing.timestamp)}) — NOT saved, NOT broadcast`);
       this.stats.duplicatePackets += 1;
       return { duplicate: true };
     }
@@ -589,6 +666,7 @@ class SerialBridgeService {
         deviceId: this.deviceCode,
         patientId,
         sequenceNumber,
+        arduinoSequenceNumber,
         arduinoTimeMs,
         raw,
         baseline,
@@ -601,22 +679,43 @@ class SerialBridgeService {
       });
     } catch (err) {
       if (err.code === 11000) {
+        console.warn(`[SerialBridge] [MongoDB] SAVE REJECTED (duplicate key) device=${this.deviceCode} seq=${sequenceNumber} event=${event}`);
         this.stats.duplicatePackets += 1;
         return { duplicate: true };
       }
-      console.error(`[SerialBridge] Failed to save PiezoEvent: ${err.message}`);
+      console.error(`[SerialBridge] [MongoDB] SAVE FAILED device=${this.deviceCode} seq=${sequenceNumber} event=${event}: ${err.message}`);
       throw err;
+    }
+
+    if (event === 'MOVEMENT') {
+      // [DIAG 2/6] Persisted
+      console.log(`[SerialBridge] [MOVEMENT] [2/6 SAVED] MongoDB _id=${savedRecord._id} device=${savedRecord.deviceId} seq=${savedRecord.sequenceNumber}${arduinoSeqLabel} count=${savedRecord.movementCount} event=${savedRecord.event} ts=${isoOrNull(savedRecord.timestamp)}`);
     }
 
     // Update device heartbeat
     try {
-      await deviceRepository.updateHeartbeat(this.deviceCode);
-    } catch {}
+      const updatedDevice = await deviceRepository.updateHeartbeat(this.deviceCode);
+      if (!updatedDevice) {
+        console.warn(`[SerialBridge] Device heartbeat update matched no Device document for ${this.deviceCode}`);
+      }
+    } catch (err) {
+      console.warn(`[SerialBridge] Device heartbeat update failed for ${this.deviceCode}: ${err.message}`);
+    }
+
+    this.highestSequenceNumber = Math.max(this.highestSequenceNumber, sequenceNumber);
+
+    // Persisted, valid DATA telemetry from the firmware is direct evidence that the sensor
+    // link is delivering readings again. SENSOR_CHECK packets are excluded (firmware flags a
+    // probe/wiring problem in that state). Gateway heartbeats and SENSOR_READY alone do NOT recover this.
+    if (status !== 'SENSOR_CHECK') {
+      await hardwareFaultService.recordRecovery(this.deviceCode, 'SENSOR_DISCONNECTED', `Valid sensor telemetry resumed (seq #${sequenceNumber})`);
+    }
 
     // Update stats and state
     this.stats.validPackets += 1;
-    this.lastReceivedAt = new Date();
+    this.lastReceivedAt = savedRecord.timestamp;
     this.lastSequenceNumber = sequenceNumber;
+    this.lastArduinoSequenceNumber = arduinoSequenceNumber;
     this.lastMovementCount = movementCount;
     this.lastSensorStatus = status;
 
@@ -663,11 +762,17 @@ class SerialBridgeService {
       });
     }
 
+    if (event === 'MOVEMENT') {
+      // [DIAG 3/6] In-memory device state updated (served by GET /api/serial/status)
+      console.log(`[SerialBridge] [MOVEMENT] [3/6 STATE] device=${this.deviceCode} lastSequenceNumber=${this.lastSequenceNumber}${arduinoSeqLabel} lastMovementCount=${this.lastMovementCount} lastPiezoActivity=${this.lastPiezoActivity} lastMovementDetectedAt=${isoOrNull(this.lastMovementDetectedAt)}`);
+    }
+
     // Broadcast live telemetry event
-    sseManager.broadcast('piezo_telemetry', {
+    const sseEventId = sseManager.broadcast('piezo_telemetry', {
       deviceId: this.deviceCode,
       patientId,
       sequenceNumber,
+      arduinoSequenceNumber,
       arduinoTimeMs,
       raw,
       baseline,
@@ -680,13 +785,11 @@ class SerialBridgeService {
       lastMovementDetectedAt: this.lastMovementDetectedAt,
     });
 
-    // ── DIAGNOSTIC: Confirm full pipeline completion ───────────────────────
     if (event === 'MOVEMENT') {
-      console.log(`[SerialBridge] [MOVEMENT] >>> MOVEMENT PIPELINE COMPLETE (Seq #${sequenceNumber}, Count=${movementCount})`);
-      console.log(`[SerialBridge] [MOVEMENT]     Gateway -> API -> MongoDB[saved:${savedRecord._id}] -> SSE[piezo_telemetry broadcast] -> Dashboard`);
-      console.log(`[SerialBridge] [MOVEMENT]     lastMovementDetectedAt updated to: ${this.lastMovementDetectedAt}`);
+      // [DIAG 4/6] SSE broadcast
+      const clientCount = typeof sseManager.getClientCount === 'function' ? sseManager.getClientCount() : 'n/a';
+      console.log(`[SerialBridge] [MOVEMENT] [4/6 SSE] piezo_telemetry id=${sseEventId} -> ${clientCount} client(s) device=${this.deviceCode} seq=${sequenceNumber}${arduinoSeqLabel} count=${movementCount} event=${event} ts=${isoOrNull(savedRecord.timestamp)}`);
     }
-    // ─────────────────────────────────────────────────────────────────────
 
     return {
       success: true,
@@ -800,6 +903,7 @@ class SerialBridgeService {
       assignedPatient,
       lastReceivedAt: this.lastReceivedAt,
       lastSequenceNumber: this.lastSequenceNumber,
+      lastArduinoSequenceNumber: this.lastArduinoSequenceNumber,
       lastMovementCount: this.lastMovementCount,
       lastMovementDetectedAt: this.lastMovementDetectedAt,
       lastPiezoActivity: this.lastPiezoActivity,
