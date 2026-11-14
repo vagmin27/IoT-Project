@@ -546,6 +546,14 @@ class SerialBridgeService {
       return null;
     }
 
+    // ── DIAGNOSTIC: Per-packet log with RAW | BASELINE | DEVIATION | THRESHOLD | EVENT | MOVEMENT_COUNT ──
+    console.log(`[SerialBridge] [DATA] RAW=${raw} | BASELINE=${baseline.toFixed(2)} | DEVIATION=${deviation} | THRESHOLD=${threshold.toFixed(2)} | EVENT=${event} | MOVEMENT_COUNT=${movementCount} | STATUS=${status} | Seq=${sequenceNumber}`);
+    if (event === 'MOVEMENT') {
+      console.log(`[SerialBridge] [MOVEMENT] >>> MOVEMENT EVENT received from gateway (Seq #${sequenceNumber}, Count=${movementCount}) RAW=${raw} DEV=${deviation} <<<`);
+      console.log(`[SerialBridge] [MOVEMENT]     Stage: Gateway -> API -> MongoDB (saving...) -> SSE -> Dashboard`);
+    }
+    // ──────────────────────────────────────────────────────────────────────────────────────────────────────
+
     // Valid telemetry packet received: recover missing packets fault and reset watchdog
     this.resetPacketWatchdog();
     await hardwareFaultService.recordRecovery(this.deviceCode, 'MISSING_PACKETS', 'Fresh telemetry data received from Arduino');
@@ -615,36 +623,37 @@ class SerialBridgeService {
     // Patient Activity Semantics (Stage 5)
     // SENSOR_CHECK does NOT change patient activity!
     // Note: Piezo vibration is kept strictly distinct from gait 'WALKING'
-    if (status === 'ACTIVE') {
-      if (event === 'MOVEMENT') {
-        this.lastPiezoActivity = 'MOVEMENT_DETECTED';
-        this.lastMovementDetectedAt = savedRecord.timestamp;
-        if (patientId) {
-          await patientRepository.updatePiezoActivityStatus(patientId, 'MOVEMENT_DETECTED');
-          sseManager.broadcast('patient_status_updated', {
-            patientId,
-            piezoActivityStatus: 'MOVEMENT_DETECTED',
-            lastMovementUpdate: new Date(),
-            lastPiezoActivityUpdate: new Date(),
-            timestamp: new Date(),
-            source: 'PIEZO_SENSOR',
-          });
-        }
-      } else if (event === 'INACTIVITY') {
-        this.lastPiezoActivity = 'NO_RECENT_MOVEMENT';
-        if (patientId) {
-          await patientRepository.updatePiezoActivityStatus(patientId, 'NO_RECENT_MOVEMENT');
-          sseManager.broadcast('patient_status_updated', {
-            patientId,
-            piezoActivityStatus: 'NO_RECENT_MOVEMENT',
-            lastMovementUpdate: new Date(),
-            lastPiezoActivityUpdate: new Date(),
-            timestamp: new Date(),
-            source: 'PIEZO_SENSOR',
-          });
-        }
+    // Note: MOVEMENT events always arrive with STATUS=ACTIVE.
+    //       INACTIVITY events arrive with STATUS=INACTIVE (firmware design).
+    //       Both must be handled regardless of status to correctly update piezo activity.
+    if (event === 'MOVEMENT' && status === 'ACTIVE') {
+      this.lastPiezoActivity = 'MOVEMENT_DETECTED';
+      this.lastMovementDetectedAt = savedRecord.timestamp;
+      if (patientId) {
+        await patientRepository.updatePiezoActivityStatus(patientId, 'MOVEMENT_DETECTED');
+        sseManager.broadcast('patient_status_updated', {
+          patientId,
+          piezoActivityStatus: 'MOVEMENT_DETECTED',
+          lastMovementUpdate: new Date(),
+          lastPiezoActivityUpdate: new Date(),
+          timestamp: new Date(),
+          source: 'PIEZO_SENSOR',
+        });
       }
-      // If event === 'NONE', retain previous piezo activity state
+    } else if (event === 'INACTIVITY') {
+      // INACTIVITY fires with STATUS=INACTIVE (firmware emits INACTIVITY,INACTIVE)
+      this.lastPiezoActivity = 'NO_RECENT_MOVEMENT';
+      if (patientId) {
+        await patientRepository.updatePiezoActivityStatus(patientId, 'NO_RECENT_MOVEMENT');
+        sseManager.broadcast('patient_status_updated', {
+          patientId,
+          piezoActivityStatus: 'NO_RECENT_MOVEMENT',
+          lastMovementUpdate: new Date(),
+          lastPiezoActivityUpdate: new Date(),
+          timestamp: new Date(),
+          source: 'PIEZO_SENSOR',
+        });
+      }
     } else if (status === 'SENSOR_CHECK') {
       // Diagnostic notice: do not change patient activity
       sseManager.broadcast('serial_diagnostic', {
@@ -670,6 +679,14 @@ class SerialBridgeService {
       timestamp: savedRecord.timestamp,
       lastMovementDetectedAt: this.lastMovementDetectedAt,
     });
+
+    // ── DIAGNOSTIC: Confirm full pipeline completion ───────────────────────
+    if (event === 'MOVEMENT') {
+      console.log(`[SerialBridge] [MOVEMENT] >>> MOVEMENT PIPELINE COMPLETE (Seq #${sequenceNumber}, Count=${movementCount})`);
+      console.log(`[SerialBridge] [MOVEMENT]     Gateway -> API -> MongoDB[saved:${savedRecord._id}] -> SSE[piezo_telemetry broadcast] -> Dashboard`);
+      console.log(`[SerialBridge] [MOVEMENT]     lastMovementDetectedAt updated to: ${this.lastMovementDetectedAt}`);
+    }
+    // ─────────────────────────────────────────────────────────────────────
 
     return {
       success: true,

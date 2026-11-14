@@ -88,6 +88,8 @@ const stats = {
   malformedPackets: 0,
   droppedDueToOverflow: 0,
   networkRetries: 0,
+  movementEventsDetected: 0,
+  movementEventsDelivered: 0,
   startedAt: new Date(),
 };
 
@@ -113,6 +115,28 @@ function sanitize(str) {
   if (!str || typeof str !== 'string') return '';
   if (!GATEWAY_SECRET) return str;
   return str.split(GATEWAY_SECRET).join('***SECRET***');
+}
+
+/**
+ * Parse key fields from a DATA CSV telemetry line for diagnostics.
+ * Format: DATA,SEQUENCE,TIME_MS,RAW,BASELINE,DEVIATION,THRESHOLD,MOVEMENT_COUNT,EVENT,STATUS
+ * Returns parsed object or null if not a DATA line.
+ */
+function parseTelemetryLine(line) {
+  if (!line || !line.startsWith('DATA,')) return null;
+  const parts = line.split(',');
+  if (parts.length !== 10) return null;
+  return {
+    seq: parts[1],
+    timeMs: parts[2],
+    raw: parts[3],
+    baseline: parts[4],
+    deviation: parts[5],
+    threshold: parts[6],
+    movementCount: parts[7],
+    event: parts[8],
+    status: parts[9],
+  };
 }
 
 /**
@@ -345,6 +369,21 @@ function enqueueLine(rawLine) {
     return;
   }
 
+  // ── DIAGNOSTIC: Per-packet log with RAW | BASELINE | DEVIATION | THRESHOLD | EVENT | MOVEMENT_COUNT ──
+  if (result.type === 'DATA') {
+    const parsed = parseTelemetryLine(result.line);
+    if (parsed) {
+      log('DATA', `RAW=${parsed.raw} | BASELINE=${parsed.baseline} | DEVIATION=${parsed.deviation} | THRESHOLD=${parsed.threshold} | EVENT=${parsed.event} | MOVEMENT_COUNT=${parsed.movementCount} | STATUS=${parsed.status}`);
+
+      if (parsed.event === 'MOVEMENT') {
+        stats.movementEventsDetected += 1;
+        log('MOVEMENT', `>>> MOVEMENT DETECTED (Seq #${parsed.seq}, Count=${parsed.movementCount}) RAW=${parsed.raw} DEV=${parsed.deviation} >= THRESH=${parsed.threshold} <<<`);
+        log('MOVEMENT', `    Stage: Arduino -> Gateway(queued) -> API -> MongoDB -> SSE -> Dashboard`);
+      }
+    }
+  }
+  // ──────────────────────────────────────────────────────────────────────────────────────────────────────
+
   // FIFO Buffer Overflow Protection
   if (packetQueue.length >= MAX_BUFFER_SIZE) {
     const dropped = packetQueue.shift();
@@ -386,6 +425,9 @@ async function processQueue() {
     // If only 1 packet is queued, use fast single-packet endpoint
     if (packetQueue.length === 1) {
       const item = packetQueue[0];
+      const ev = item.line.split(',')[8] || '?';
+      const seq = item.globalSeq ?? item.line.split(',')[1] ?? '?';
+
       const res = await sendToCloud('/api/iot/telemetry', {
         line: item.line,
         arduinoSerialStatus: serialStatus,
@@ -401,9 +443,14 @@ async function processQueue() {
         }
         stats.telemetrySentNew += 1;
         backoffDelayMs = 1000; // Reset backoff on success
-        const seq = item.globalSeq ?? item.line.split(',')[1] ?? '?';
-        const ev = item.line.split(',')[8] || '?';
         log('CLOUD', `Forwarded Seq #${seq} (Arduino #${item.rawSeq ?? '?'}) [${ev}] -> HTTP 201 Created (DB saved)`);
+
+        // ── DIAGNOSTIC: Confirm MOVEMENT successfully reached cloud ───────
+        if (ev === 'MOVEMENT') {
+          stats.movementEventsDelivered += 1;
+          log('MOVEMENT', `>>> MOVEMENT DELIVERED to cloud/MongoDB (Seq #${seq}) | Stage: Gateway -> API[201] -> MongoDB ✓ -> SSE -> Dashboard <<<`);
+        }
+        // ─────────────────────────────────────────────────────────────────
       } else if (res.status === 200 && res.data?.duplicate) {
         // Confirmed duplicate: safely acknowledged
         packetQueue.shift();
@@ -412,8 +459,13 @@ async function processQueue() {
         }
         stats.telemetrySentDuplicates += 1;
         backoffDelayMs = 1000;
-        const seq = item.globalSeq ?? item.line.split(',')[1] ?? '?';
         log('CLOUD', `Seq #${seq} already in DB -> HTTP 200 (Duplicate acknowledged)`);
+
+        // Count movement duplicates as delivered too (already in DB = successfully stored before)
+        if (ev === 'MOVEMENT') {
+          stats.movementEventsDelivered += 1;
+          log('MOVEMENT', `>>> MOVEMENT Seq #${seq} already in MongoDB (duplicate ack) - confirmed stored <<<`);
+        }
       } else if (res.status === 200 && res.data?.type === 'DIAGNOSTIC') {
         // Diagnostic or startup message
         packetQueue.shift();
@@ -429,11 +481,15 @@ async function processQueue() {
         packetQueue.shift();
         stats.malformedPackets += 1;
         log('REJECTED', `Malformed packet rejected by backend (HTTP 400): ${item.line} -> ${res.data?.message || 'Validation failed'}`, 'error');
+        if (ev === 'MOVEMENT') {
+          log('MOVEMENT', `>>> MOVEMENT EVENT LOST: rejected by cloud (HTTP 400). Check CSV format: ${item.line}`, 'error');
+        }
       } else if (res.status === 401 || res.status === 403) {
         // Authentication error
         item.retries += 1;
         stats.networkRetries += 1;
         log('AUTH', `Gateway authentication rejected (HTTP ${res.status}): ${res.data?.message}`, 'error');
+        log('AUTH', 'ACTION REQUIRED: Verify GATEWAY_SECRET in backend/gateway/.env matches the value on Render.', 'error');
         backoffDelayMs = Math.min(backoffDelayMs * 2, 15000);
         backoffUntilTimestamp = Date.now() + backoffDelayMs;
       } else {
@@ -450,7 +506,9 @@ async function processQueue() {
       const batchItems = packetQueue.slice(0, batchSize);
       const batchLines = batchItems.map((b) => b.line);
 
-      log('BATCH', `Flushing batch of ${batchSize} queued packets to cloud...`);
+      // Count MOVEMENT events in this batch for diagnostics
+      const movementInBatch = batchItems.filter((b) => (b.line.split(',')[8] || '') === 'MOVEMENT').length;
+      log('BATCH', `Flushing batch of ${batchSize} queued packets to cloud${movementInBatch > 0 ? ` [includes ${movementInBatch} MOVEMENT event(s)]` : ''}...`);
 
       const res = await sendToCloud('/api/iot/telemetry', {
         lines: batchLines,
@@ -469,9 +527,15 @@ async function processQueue() {
         stats.telemetrySentDuplicates += (res.data.duplicates || 0);
         backoffDelayMs = 1000;
         log('BATCH', `Flushed ${batchSize} packets -> ${res.data.newRecords} saved, ${res.data.duplicates} duplicates, ${res.data.errors || 0} errors (Remaining queue: ${packetQueue.length})`);
+
+        if (movementInBatch > 0) {
+          stats.movementEventsDelivered += movementInBatch;
+          log('MOVEMENT', `>>> ${movementInBatch} MOVEMENT EVENT(S) delivered via batch flush -> confirmed reaching cloud <<<`);
+        }
       } else if (res.status === 401 || res.status === 403) {
         stats.networkRetries += 1;
         log('AUTH', `Batch auth failed (HTTP ${res.status}): ${res.data?.message}`, 'error');
+        log('AUTH', 'ACTION REQUIRED: Verify GATEWAY_SECRET in backend/gateway/.env matches the value on Render.', 'error');
         backoffDelayMs = Math.min(backoffDelayMs * 2, 15000);
         backoffUntilTimestamp = Date.now() + backoffDelayMs;
       } else {
@@ -690,16 +754,18 @@ function setupGracefulShutdown() {
     const uptimeSec = Math.round((Date.now() - stats.startedAt.getTime()) / 1000);
     console.log('-------------------------------------------------------');
     console.log(' GATEWAY SESSION SUMMARY');
-    console.log(` - Uptime:                  ${uptimeSec} seconds`);
-    console.log(` - Serial Lines Read:       ${stats.serialLinesRead}`);
-    console.log(` - New Packets Stored:      ${stats.telemetrySentNew}`);
-    console.log(` - Duplicates Acknowledged: ${stats.telemetrySentDuplicates}`);
-    console.log(` - Serial Dups Suppressed:   ${stats.serialDuplicatesSuppressed}`);
-    console.log(` - Diagnostics Sent:        ${stats.diagnosticsSent}`);
-    console.log(` - Rejected Malformed:      ${stats.malformedPackets}`);
-    console.log(` - Overflow Dropped:        ${stats.droppedDueToOverflow}`);
-    console.log(` - Network Retries:         ${stats.networkRetries}`);
-    console.log(` - Remaining in Queue:      ${packetQueue.length}`);
+    console.log(` - Uptime:                    ${uptimeSec} seconds`);
+    console.log(` - Serial Lines Read:         ${stats.serialLinesRead}`);
+    console.log(` - New Packets Stored:        ${stats.telemetrySentNew}`);
+    console.log(` - Duplicates Acknowledged:   ${stats.telemetrySentDuplicates}`);
+    console.log(` - Serial Dups Suppressed:    ${stats.serialDuplicatesSuppressed}`);
+    console.log(` - Diagnostics Sent:          ${stats.diagnosticsSent}`);
+    console.log(` - Rejected Malformed:        ${stats.malformedPackets}`);
+    console.log(` - Overflow Dropped:          ${stats.droppedDueToOverflow}`);
+    console.log(` - Network Retries:           ${stats.networkRetries}`);
+    console.log(` - Remaining in Queue:        ${packetQueue.length}`);
+    console.log(` - MOVEMENT Events Detected:  ${stats.movementEventsDetected}`);
+    console.log(` - MOVEMENT Events Delivered: ${stats.movementEventsDelivered}`);
     console.log('-------------------------------------------------------');
     log('SYSTEM', 'Gateway stopped.');
     process.exitCode = 0;
@@ -759,6 +825,19 @@ async function main() {
     // If there were recovered unacknowledged packets from a previous crash, enqueue them now
     if (syncInfo.recoveredPackets > 0) {
       const recovered = sequenceManager.getPendingPackets();
+
+      // Log movement events among recovered packets
+      const recoveredMovements = recovered.filter((p) => (p.line.split(',')[8] || '') === 'MOVEMENT');
+      if (recoveredMovements.length > 0) {
+        log('MOVEMENT', `>>> Found ${recoveredMovements.length} undelivered MOVEMENT event(s) in recovered queue - retrying delivery <<<`);
+        recoveredMovements.forEach((p) => {
+          const parsed = parseTelemetryLine(p.line);
+          if (parsed) {
+            log('MOVEMENT', `    - Seq #${p.globalSeq}: RAW=${parsed.raw} DEV=${parsed.deviation} COUNT=${parsed.movementCount}`);
+          }
+        });
+      }
+
       for (const pkt of recovered) {
         packetQueue.push({
           line: pkt.line,

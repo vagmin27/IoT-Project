@@ -60,12 +60,17 @@ export const ArduinoStatusCard = () => {
         if (!prev) return prev;
 
         const isMovement = telemetry.event === 'MOVEMENT' && telemetry.status === 'ACTIVE';
-        const isInactive = telemetry.event === 'INACTIVITY' && telemetry.status === 'ACTIVE';
+        const isInactive = telemetry.event === 'INACTIVITY' && telemetry.status === 'INACTIVE';
 
-        // Update last movement timestamp ONLY when EVENT === MOVEMENT and STATUS === ACTIVE
+        // Update last movement timestamp ONLY when EVENT === MOVEMENT and STATUS === ACTIVE.
+        // For all other events, preserve the existing timestamp from either:
+        //   1. The SSE payload's lastMovementDetectedAt (server echoes it back), or
+        //   2. The previous local state.
+        // Never overwrite a valid timestamp with undefined/null.
+        const serverMovementTs = telemetry.lastMovementDetectedAt || null;
         const newMovementDetectedAt = isMovement
-          ? (telemetry.timestamp || new Date())
-          : (telemetry.lastMovementDetectedAt || prev.lastMovementDetectedAt);
+          ? (telemetry.timestamp || new Date().toISOString())
+          : (serverMovementTs || prev.lastMovementDetectedAt || null);
 
         // Update piezo activity indicator
         const newActivity = isMovement
@@ -76,7 +81,7 @@ export const ArduinoStatusCard = () => {
 
         return {
           ...prev,
-          lastReceivedAt: telemetry.timestamp || new Date(),
+          lastReceivedAt: telemetry.timestamp || new Date().toISOString(),
           lastSequenceNumber: telemetry.sequenceNumber,
           lastMovementCount: telemetry.movementCount !== undefined ? telemetry.movementCount : prev.lastMovementCount,
           lastMovementDetectedAt: newMovementDetectedAt,
